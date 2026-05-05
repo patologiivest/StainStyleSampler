@@ -1,6 +1,5 @@
 # StainStyleSampler
 
-[Under construction]
 ## Overview
 
 The StainStyleSampler is a Python tool designed for extracting color and stain features from histological images. It leverages various color conversion techniques, stain deconvolution, and clustering methods to build feature representations, generate 2D embeddings (via PCA or UMAP), create histograms, and select representative image references. The project integrates multiple libraries including HistomicsTK for specialized color deconvolution and tissue detection.
@@ -17,3 +16,15 @@ The StainStyleSampler is a Python tool designed for extracting color and stain f
 
 ## Dependencies
 
+
+## Installation
+1. Clone the Repository:
+```
+   git clone https://github.com/patologiivest/StainStyleSampler.git
+   cd StainStyleSampler
+```
+4. Create a Virtual Environment:
+```
+  conda env create -f "env-file.yml"
+  source venv/bin/activate  # On Windows: venv\Scripts\activate
+```
