@@ -14,17 +14,31 @@ The StainStyleSampler is a Python tool designed for extracting color and stain f
 - Reference Selection:
   - Supports various reference selection methods including random, representative, grouped, and density-based approaches.
 
-## Dependencies
-
-
 ## Installation
-1. Clone the Repository:
+1. Clone the repository:
+
+```bash
+git clone https://github.com/patologiivest/StainStyleSampler.git
+cd StainStyleSampler
 ```
-   git clone https://github.com/patologiivest/StainStyleSampler.git
-   cd StainStyleSampler
+
+2. Create and activate a Python virtual environment:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
 ```
-4. Create a Virtual Environment:
+
+On Windows PowerShell:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 ```
-  conda env create -f "env-file.yml"
-  source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+3. Install the Python dependencies:
+
+```bash
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```

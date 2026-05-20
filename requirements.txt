@@ -1,0 +1,29 @@
+# Python 3.10+ recommended.
+#
+# Create and install with:
+#   python -m venv .venv
+#   source .venv/bin/activate
+#   python -m pip install --upgrade pip
+#   python -m pip install -r requirements.txt
+
+numpy==1.26.4
+pandas==2.2.2
+Pillow==10.4.0
+
+matplotlib==3.9.2
+seaborn==0.13.2
+
+scipy==1.13.1
+scikit-image==0.24.0
+scikit-learn==1.5.1
+umap-learn==0.5.7
+
+opencv-python==4.10.0.84
+shapely==2.0.5
+natsort==8.4.0
+
+joblib==1.4.2
+tqdm==4.66.5
+tqdm-joblib==0.0.4
+
+ipykernel==6.29.5
