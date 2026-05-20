@@ -28,18 +28,6 @@ from natsort import os_sorted
 from shapely.geometry import Polygon, MultiPolygon
 from matplotlib.path import Path
 
-# HistomicsTK Imports
-from histomicstk.preprocessing.color_conversion import (
-    rgb_to_lab, lab_mean_std, rgb_to_hsi
-)
-from histomicstk.preprocessing.color_deconvolution import (
-    stain_color_map, rgb_separate_stains_macenko_pca, color_deconvolution, find_stain_index
-)
-from histomicstk.saliency.tissue_detection import (
-    get_slide_thumbnail, get_tissue_mask, threshold_multichannel
-)
-from histomicstk.utils import simple_mask
-
 # Local Imports
 import Utils.StainUtils as SU
 import Utils.VisualizationUtils as VU

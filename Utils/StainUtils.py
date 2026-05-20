@@ -2,6 +2,7 @@
 import os
 import glob
 import random
+import collections
 from collections import defaultdict
 
 # Third-Party Library Imports
@@ -23,17 +24,449 @@ from matplotlib.pyplot import hist2d
 from matplotlib.colors import Normalize
 import tqdm
 
-# HistomicsTK Imports
-from histomicstk.preprocessing.color_conversion import (
-    rgb_to_lab, lab_mean_std, rgb_to_hsi
+STAIN_COLOR_MAP = {
+    'hematoxylin': np.array([0.65, 0.70, 0.29], dtype=np.float64),
+    'eosin': np.array([0.07, 0.99, 0.11], dtype=np.float64),
+    'dab': np.array([0.27, 0.57, 0.78], dtype=np.float64),
+    'null': np.array([0.0, 0.0, 0.0], dtype=np.float64),
+}
+
+_RGB_TO_LMS = np.array([
+    [0.3811, 0.5783, 0.0402],
+    [0.1967, 0.7244, 0.0782],
+    [0.0241, 0.1288, 0.8444],
+])
+_LMS_TO_LAB = np.dot(
+    np.array([
+        [1 / (3 ** 0.5), 0, 0],
+        [0, 1 / (6 ** 0.5), 0],
+        [0, 0, 1 / (2 ** 0.5)],
+    ]),
+    np.array([
+        [1, 1, 1],
+        [1, 1, -2],
+        [1, -1, 0],
+    ]),
 )
-from histomicstk.preprocessing.color_deconvolution import (
-    stain_color_map, rgb_separate_stains_macenko_pca, color_deconvolution, find_stain_index
-)
-from histomicstk.saliency.tissue_detection import (
-    get_slide_thumbnail, get_tissue_mask, threshold_multichannel
-)
-from histomicstk.utils import simple_mask
+
+
+def rgb_to_lab(img: np.ndarray) -> np.ndarray:
+    """Convert RGB image data to HistomicsTK's Ruderman LAB space."""
+    m, n = img.shape[:2]
+    rgb = np.reshape(img, (m * n, 3))
+    lms = np.dot(_RGB_TO_LMS, np.transpose(rgb))
+    lms[lms == 0] = np.spacing(1)
+    lab = np.dot(_LMS_TO_LAB, np.log(lms))
+    return np.reshape(lab.transpose(), (m, n, 3))
+
+
+def rgb_to_hsi(img: np.ndarray) -> np.ndarray:
+    """Convert RGB image data to HistomicsTK's HSI representation."""
+    img = np.moveaxis(img, -1, 0)
+    if len(img) not in (3, 4):
+        raise ValueError(
+            'Expected 3-channel RGB or 4-channel RGBA image;'
+            f' received a {len(img)}-channel image'
+        )
+    img = img[:3]
+    hues = (
+        np.arctan2(3 ** 0.5 * (img[1] - img[2]), 2 * img[0] - img[1] - img[2])
+        / (2 * np.pi)
+    ) % 1
+    intensities = img.mean(0)
+    saturations = np.where(
+        intensities, 1 - img.min(0) / np.maximum(intensities, 1e-10), 0
+    )
+    return np.stack([hues, saturations, intensities], -1)
+
+
+def convert_image_to_matrix(img: np.ndarray) -> np.ndarray:
+    """Convert an image to HistomicsTK's channel-by-pixel matrix format."""
+    if img.ndim == 2:
+        return img
+    return img.reshape((-1, img.shape[-1])).T
+
+
+def convert_matrix_to_image(matrix: np.ndarray, shape: tuple) -> np.ndarray:
+    """Convert a channel-by-pixel matrix back to an image."""
+    if len(shape) == 2:
+        return matrix
+    return matrix.T.reshape(shape[:-1] + (matrix.shape[0],))
+
+
+def exclude_nonfinite(matrix: np.ndarray) -> np.ndarray:
+    """Drop matrix columns containing NaN or infinite values."""
+    return matrix[:, np.isfinite(matrix).all(axis=0)]
+
+
+def threshold_multichannel(
+        img: np.ndarray, thresholds: dict, channels: list = None,
+        just_threshold: bool = False, get_tissue_mask_kwargs: dict = None) -> tuple:
+    """Threshold a multi-channel image using HistomicsTK-compatible semantics."""
+    channels = ['hue', 'saturation', 'intensity'] if channels is None else channels
+    if get_tissue_mask_kwargs is None:
+        get_tissue_mask_kwargs = {
+            'n_thresholding_steps': 1,
+            'sigma': 5.0,
+            'min_size': 10,
+        }
+
+    mask = np.ones(img.shape[:2])
+    for axis, channel_name in enumerate(channels):
+        channel = img[..., axis].copy()
+        mask[channel < thresholds[channel_name]['min']] = 0
+        mask[channel >= thresholds[channel_name]['max']] = 0
+
+    if just_threshold or (np.unique(mask).shape[0] < 1):
+        labeled = mask
+    else:
+        get_tissue_mask_kwargs['deconvolve_first'] = False
+        labeled, mask = get_tissue_mask(mask, **get_tissue_mask_kwargs)
+
+    return labeled, mask
+
+
+def get_tissue_mask(
+        thumbnail_img: np.ndarray, deconvolve_first: bool = False,
+        stain_unmixing_routine_kwargs: dict = None,
+        n_thresholding_steps: int = 1, sigma: float = 0.0,
+        min_size: int = 500) -> tuple:
+    """Create a tissue mask from a thumbnail image."""
+    from scipy import ndimage
+    from skimage.filters import gaussian
+
+    stain_unmixing_routine_kwargs = (
+        {} if stain_unmixing_routine_kwargs is None else stain_unmixing_routine_kwargs
+    )
+
+    if deconvolve_first and (len(thumbnail_img.shape) == 3):
+        stain_unmixing_routine_kwargs['stains'] = ['hematoxylin', 'eosin']
+        stains, _, _ = color_deconvolution_routine(thumbnail_img, **stain_unmixing_routine_kwargs)
+        thumbnail = 255 - stains[..., 0]
+    elif len(thumbnail_img.shape) == 3:
+        thumbnail = 255 - cv2.cvtColor(thumbnail_img, cv2.COLOR_BGR2GRAY)
+    else:
+        thumbnail = thumbnail_img
+
+    for _ in range(n_thresholding_steps):
+        if sigma > 0.0:
+            thumbnail = gaussian(
+                thumbnail, sigma=sigma, output=None, mode='nearest', preserve_range=True
+            )
+        try:
+            threshold = threshold_otsu(thumbnail[thumbnail > 0])
+        except ValueError:
+            threshold = 0
+        thumbnail[thumbnail < threshold] = 0
+
+    mask = 0 + (thumbnail > 0)
+    labeled, _ = ndimage.label(mask)
+    unique, counts = np.unique(labeled[labeled > 0], return_counts=True)
+    discard = np.in1d(labeled, unique[counts < min_size]).reshape(labeled.shape)
+    labeled[discard] = 0
+    mask = labeled == unique[np.argmax(counts)]
+    return labeled, mask
+
+
+def simple_mask(img: np.ndarray, bandwidth: float = 2, bgnd_std: float = 2.5,
+                tissue_std: float = 30, min_peak_width: float = 10,
+                max_peak_width: float = 25, fraction: float = 0.10,
+                min_tissue_prob: float = 0.05) -> np.ndarray:
+    """Segment foreground tissue with HistomicsTK's grayscale GMM approach."""
+    from scipy import signal
+    from scipy.optimize import fmin_slsqp
+    from scipy.stats import norm
+    from skimage import color
+    from sklearn.neighbors import KernelDensity
+
+    gray_img = (255 * color.rgb2gray(img)).astype(np.uint8)
+    num_samples = int(fraction * gray_img.size)
+    sampled_intensities = np.random.choice(gray_img.flatten(), num_samples)[:, np.newaxis]
+
+    kde = KernelDensity(kernel='gaussian', bandwidth=bandwidth).fit(sampled_intensities)
+    x_hist = np.linspace(0, 255, 256)[:, np.newaxis]
+    y_hist = np.exp(kde.score_samples(x_hist))[:, np.newaxis]
+    y_hist = y_hist / sum(y_hist)
+    y_hist = np.flipud(y_hist)
+
+    peaks = signal.find_peaks_cwt(y_hist.flatten(), np.arange(min_peak_width, max_peak_width))
+    background_peak = peaks[0]
+    if len(peaks) > 1:
+        tissue_peak = peaks[y_hist[peaks[1:]].argmax() + 1]
+    else:
+        tissue_peak = x_hist[int(np.round(0.66 * x_hist.size))].item()
+
+    background_scale = estimate_variance(x_hist, y_hist, background_peak)
+    if background_scale == -1:
+        background_scale = bgnd_std
+
+    tissue_scale = estimate_variance(x_hist, y_hist, tissue_peak)
+    if tissue_scale == -1:
+        tissue_scale = tissue_std
+
+    mix = y_hist[background_peak] * (background_scale * (2 * np.pi) ** 0.5)
+    try:
+        if len(mix) == 1:
+            mix = mix[0]
+    except Exception:
+        pass
+
+    x_hist = x_hist.flatten()
+    y_hist = y_hist.flatten()
+
+    def gaussian_mixture(x, mu1, mu2, sigma1, sigma2, p):
+        background = norm(loc=mu1, scale=sigma1)
+        tissue = norm(loc=mu2, scale=sigma2)
+        return p * background.pdf(x) + (1 - p) * tissue.pdf(x)
+
+    def gaussian_residuals(parameters, y, x):
+        mu1, mu2, sigma1, sigma2, p = parameters
+        y_hat = gaussian_mixture(x, mu1, mu2, sigma1, sigma2, p)
+        return sum((y - y_hat) ** 2)
+
+    parameters = fmin_slsqp(
+        gaussian_residuals,
+        [background_peak, tissue_peak, background_scale, tissue_scale, mix],
+        args=(y_hist, x_hist),
+        bounds=[(0, 255), (0, 255), (np.spacing(1), 10), (np.spacing(1), 50), (0, 1)],
+        iprint=0,
+    )
+
+    mu_background, mu_tissue, sigma_background, sigma_tissue, p = parameters
+    background = norm(loc=mu_background, scale=sigma_background)
+    tissue = norm(loc=mu_tissue, scale=sigma_tissue)
+    p_background = p * background.pdf(x_hist)
+    p_tissue = (1 - p) * tissue.pdf(x_hist)
+
+    difference = p_tissue - p_background
+    candidates = np.nonzero(difference >= 0)[0]
+    filtered = np.nonzero(x_hist[candidates] > mu_background)
+    ml_threshold = x_hist[candidates[filtered[0]][0]]
+
+    endpoints = np.asarray(tissue.interval(1 - min_tissue_prob / 2))
+    ml_threshold = 255 - ml_threshold
+    endpoints = np.sort(255 - endpoints)
+
+    mask = (
+        (gray_img <= ml_threshold)
+        & (gray_img >= endpoints[0])
+        & (gray_img <= endpoints[1])
+    )
+    return mask.astype(np.uint8)
+
+
+def estimate_variance(x: np.ndarray, y: np.ndarray, peak: float) -> float:
+    """Estimate a histogram peak's standard deviation from its FWHM."""
+    peak = int(peak)
+    left = peak
+    while y[left] > y[peak] / 2 and left >= 0:
+        left -= 1
+        if left == -1:
+            break
+
+    right = peak
+    while y[right] > y[peak] / 2 and right < y.size:
+        right += 1
+        if right == y.size:
+            break
+
+    if left != -1 and right != y.size:
+        left_slope = y[left + 1] - y[left] / (x[left + 1] - x[left])
+        left = (y[peak] / 2 - y[left]) / left_slope + x[left]
+        right_slope = y[right] - y[right - 1] / (x[right] - x[right - 1])
+        right = (y[peak] / 2 - y[right]) / right_slope + x[right]
+        scale = (right - left) / 2.355
+    if left == -1:
+        if right == y.size:
+            scale = -1
+        else:
+            right_slope = y[right] - y[right - 1] / (x[right] - x[right - 1])
+            right = (y[peak] / 2 - y[right]) / right_slope + x[right]
+            scale = 2 * (right - x[peak]) / 2.355
+    if right == y.size:
+        if left == -1:
+            scale = -1
+        else:
+            left_slope = y[left + 1] - y[left] / (x[left + 1] - x[left])
+            left = (y[peak] / 2 - y[left]) / left_slope + x[left]
+            scale = 2 * (x[peak] - left) / 2.355
+
+    try:
+        if len(scale) == 1:
+            scale = scale[0]
+    except Exception:
+        pass
+    return scale
+
+
+def _normalize_stain_matrix(w: np.ndarray) -> np.ndarray:
+    return w / _stain_magnitude(w)
+
+
+def _stain_magnitude(w: np.ndarray) -> np.ndarray:
+    return np.sqrt((w ** 2).sum(0))
+
+
+def _get_principal_components(matrix: np.ndarray) -> np.ndarray:
+    return np.linalg.svd(matrix.astype(float), full_matrices=False)[0].astype(matrix.dtype)
+
+
+def _complement_stain_matrix(w: np.ndarray) -> np.ndarray:
+    stain0 = w[:, 0]
+    stain1 = w[:, 1]
+    stain2 = np.cross(stain0, stain1)
+    return np.array([stain0, stain1, stain2 / np.linalg.norm(stain2)]).T
+
+
+def _get_angles(matrix: np.ndarray) -> np.ndarray:
+    matrix = _normalize_stain_matrix(matrix)
+    return (1 - matrix[1]) * np.sign(matrix[0])
+
+
+def _argpercentile(values: np.ndarray, percentile: float) -> int:
+    index = min(int(percentile * values.size + 0.5), values.size - 1)
+    return np.argpartition(values, index)[index]
+
+
+def rgb_to_sda(img: np.ndarray, I_0: int, allow_negatives: bool = False) -> np.ndarray:
+    """Transform RGB data to HistomicsTK SDA space."""
+    is_matrix = img.ndim == 2
+    if is_matrix:
+        img = img.T
+    if I_0 is None:
+        img = img.astype(float) + 1
+        I_0 = 256
+
+    img = np.maximum(img, 1e-10)
+    sda = -np.log(img / (1.0 * I_0)) * 255 / np.log(I_0)
+    if not allow_negatives:
+        sda = np.maximum(sda, 0)
+    return sda.T if is_matrix else sda
+
+
+def sda_to_rgb(img: np.ndarray, I_0: int) -> np.ndarray:
+    """Transform HistomicsTK SDA data back to RGB-like intensity space."""
+    is_matrix = img.ndim == 2
+    if is_matrix:
+        img = img.T
+
+    old_od_mode = I_0 is None
+    if old_od_mode:
+        I_0 = 256
+
+    rgb = I_0 ** (1 - img / 255.0)
+    return (rgb.T if is_matrix else rgb) - old_od_mode
+
+
+def separate_stains_macenko_pca(
+        img_sda: np.ndarray, minimum_magnitude: float = 16,
+        min_angle_percentile: float = 0.01,
+        max_angle_percentile: float = 0.99,
+        mask_out: np.ndarray = None) -> np.ndarray:
+    """Estimate stain matrix from an SDA image with HistomicsTK's Macenko PCA method."""
+    matrix = convert_image_to_matrix(img_sda)
+
+    if mask_out is not None:
+        keep_mask = np.equal(mask_out[..., None], False)
+        keep_mask = np.tile(keep_mask, (1, 1, 3))
+        keep_mask = convert_image_to_matrix(keep_mask)
+        matrix = matrix[:, keep_mask.all(axis=0)]
+
+    matrix = exclude_nonfinite(matrix)
+    principal_components = _get_principal_components(matrix)
+    projected = principal_components.T[:-1].dot(matrix)
+    filtered = projected[:, _stain_magnitude(projected) > minimum_magnitude]
+    angles = _get_angles(filtered)
+
+    def get_percentile_vector(percentile):
+        return principal_components[:, :-1].dot(
+            filtered[:, _argpercentile(angles, percentile)]
+        )
+
+    min_vector = get_percentile_vector(min_angle_percentile)
+    max_vector = get_percentile_vector(max_angle_percentile)
+    return _complement_stain_matrix(
+        _normalize_stain_matrix(np.array([min_vector, max_vector]).T)
+    )
+
+
+def rgb_separate_stains_macenko_pca(img: np.ndarray, I_0: int, *args, **kwargs) -> np.ndarray:
+    """Estimate a stain matrix from RGB input using HistomicsTK's Macenko PCA method."""
+    return separate_stains_macenko_pca(rgb_to_sda(img, I_0), *args, **kwargs)
+
+
+def find_stain_index(reference_stain: np.ndarray, w_est: np.ndarray) -> int:
+    """Find the estimated stain column closest to a reference stain vector."""
+    dot_products = np.dot(
+        _normalize_stain_matrix(np.array(reference_stain)),
+        _normalize_stain_matrix(np.array(w_est)),
+    )
+    return int(np.argmax(np.abs(dot_products)))
+
+
+def color_deconvolution(img: np.ndarray, w_est: np.ndarray, I_0: int = None) -> tuple:
+    """Perform HistomicsTK-compatible color deconvolution."""
+    w_est = np.array(w_est)
+    if w_est.shape[1] < 3:
+        complemented = np.zeros((w_est.shape[0], 3))
+        complemented[:, :w_est.shape[1]] = w_est
+        w_est = complemented
+
+    if np.linalg.norm(w_est[:, 2]) <= 1e-16:
+        complemented = _complement_stain_matrix(w_est)
+    else:
+        complemented = w_est
+
+    complemented = _normalize_stain_matrix(complemented)
+    inverse = np.linalg.pinv(complemented)
+    matrix = convert_image_to_matrix(img)[:3]
+    sda_forward = rgb_to_sda(matrix, I_0)
+    sda_deconvolved = np.dot(inverse, sda_forward)
+    sda_inverse = sda_to_rgb(sda_deconvolved, 255 if I_0 is not None else None)
+    stains_float = convert_matrix_to_image(sda_inverse, img.shape)
+    stains = stains_float.clip(0, 255).astype(np.uint8)
+
+    unmixed = collections.namedtuple('Unmixed', ['Stains', 'StainsFloat', 'Wc'])
+    return unmixed(stains, stains_float, complemented)
+
+
+def color_deconvolution_routine(img: np.ndarray, W_source: np.ndarray = None,
+                                mask_out: np.ndarray = None, **kwargs) -> tuple:
+    """Small local equivalent of HistomicsTK's deconvolution routine."""
+    if W_source is None:
+        W_source = stain_unmixing_routine(img, mask_out=mask_out, **kwargs)
+    stains, stains_float, complemented = color_deconvolution(img, w_est=W_source, I_0=None)
+    if mask_out is not None:
+        for channel in range(3):
+            stains[..., channel][mask_out] = 255
+            stains_float[..., channel][mask_out] = 255.0
+    return stains, stains_float, complemented
+
+
+def stain_unmixing_routine(
+        img: np.ndarray, stains: list = None,
+        stain_unmixing_method: str = 'macenko_pca',
+        stain_unmixing_params: dict = None,
+        mask_out: np.ndarray = None) -> np.ndarray:
+    """Estimate and order a stain matrix for color deconvolution."""
+    stains = ['hematoxylin', 'eosin'] if stains is None else stains
+    stain_unmixing_params = {} if stain_unmixing_params is None else stain_unmixing_params
+
+    if stain_unmixing_method.lower() != 'macenko_pca':
+        raise ValueError('Unknown/Unimplemented deconvolution method.')
+
+    stain_unmixing_params['I_0'] = None
+    stain_unmixing_params['mask_out'] = mask_out
+    matrix = rgb_separate_stains_macenko_pca(img, **stain_unmixing_params)
+    return _reorder_stains(matrix, stains=stains)
+
+
+def _reorder_stains(w: np.ndarray, stains: list = None) -> np.ndarray:
+    stains = ['hematoxylin', 'eosin'] if stains is None else stains
+    assert len(stains) == 2, 'Only two-stain matrices are supported for now.'
+    first = find_stain_index(STAIN_COLOR_MAP[stains[0]], w)
+    second = 1 - first
+    return np.stack([w[..., channel] for channel in (first, second, 2)], -1)
 
 def get_background_mask(img: np.ndarray, method: str = 'Old') -> np.ndarray:
     """
@@ -135,20 +568,20 @@ def get_stains_deconvoluted(img: np.ndarray, I_0: int = 255) -> tuple:
     Returns:
         tuple: Separated stain images (stain_1, stain_2).
     """
-    def extract_stain(stain_name: str, w_est: np.ndarray, deconv_result: np.ndarray) -> np.ndarray:
+    def extract_stain(stain_name: str, w_est: np.ndarray, deconv_result: tuple) -> np.ndarray:
         """Extract a specific stain based on its name."""
         stain_index = find_stain_index(color_map[stain_name], w_est)
         return I_0 - deconv_result.Stains[:, :, stain_index]
 
-    assert I_0 > 0 or I_0 is None or I_0 == 'auto', "I_0 must be a positive integer or 'auto'"
+    assert I_0 is None or I_0 == 'auto' or I_0 > 0, "I_0 must be a positive integer or 'auto'"
 
     # Define color map and stains
-    color_map = stain_color_map
+    color_map = STAIN_COLOR_MAP
     stains = ['hematoxylin',  # nuclei stain
               'eosin',        # cytoplasm stain
               'null']         # for cases with only two stains
 
-    if I_0 is None or 'auto':
+    if I_0 is None or I_0 == 'auto':
         I_0 = estimate_I_0(img)
 
     # Perform Macenko PCA-based stain separation
