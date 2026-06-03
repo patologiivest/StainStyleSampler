@@ -184,8 +184,6 @@ def get_gmm_clusters(xy, n_clusters):
 
     return labels, means, metrics
 
-import numpy as np
-
 def get_uniform_binning_clusters(xy, n_clusters,method='exact'):
     """
     Performs uniform binning clustering.
@@ -246,16 +244,13 @@ def get_uniform_binning_clusters(xy, n_clusters,method='exact'):
     y_edges = np.linspace(y_min, y_max, ny + 1)
     
     # For each point, find the corresponding bin index.
-    # np.digitize returns indices in 1...len(bins), so subtract 1 for 0-based indexing.
     x_bin_indices = np.digitize(xy[:, 0], x_edges) - 1
     y_bin_indices = np.digitize(xy[:, 1], y_edges) - 1
     
-    # Points that lie exactly on the right (or top) edge might get index == nx or ny; clip these.
     x_bin_indices = np.clip(x_bin_indices, 0, nx - 1)
     y_bin_indices = np.clip(y_bin_indices, 0, ny - 1)
     
     # Compute a single cluster label for each point.
-    # Here we use label = (x_index * ny) + y_index so that labels run from 0 to (n_clusters - 1).
     labels = x_bin_indices * ny + y_bin_indices
 
     # Compute cluster centers and the sum-of-squared distances metric.
@@ -281,81 +276,3 @@ def get_uniform_binning_clusters(xy, n_clusters,method='exact'):
             cluster_centers[label] = np.array([center_x, center_y])
     
     return labels, cluster_centers, total_ssd
-
-'''def get_uniform_binning_clusters(xy, n_clusters):
-    """
-    Performs uniform binning clustering.
-    
-    This function divides the bounding box of the data uniformly into a grid and 
-    assigns each point to the corresponding bin. The grid dimensions (number of bins
-    in x and y) are chosen so that the total number of bins is at least n_clusters.
-    
-    Args:
-        xy (np.ndarray): Data points for clustering with shape (n_samples, 2).
-        n_clusters (int): Desired (approximate) number of clusters.
-    
-    Returns:
-        tuple: (cluster_labels, cluster_centers, metric)
-            - cluster_labels (np.ndarray): An integer array of shape (n_samples,)
-              indicating the cluster (bin) index for each point.
-            - cluster_centers (np.ndarray): A (total_bins, 2) array of cluster centers.
-              For bins with no points, the bin center is used.
-            - metric (float): Sum of squared distances from each point to its cluster center.
-    """
-    # Ensure xy has shape (n_samples, 2)
-    if xy.ndim != 2 or xy.shape[1] != 2:
-        raise ValueError("xy must be a 2D array with shape (n_samples, 2)")
-    
-    n_samples = xy.shape[0]
-    
-    # Determine grid dimensions:
-    # Let nx be the number of bins along the x-dimension and ny along the y-dimension.
-    # A common approach is to set nx = ceil(sqrt(n_clusters)) and ny = ceil(n_clusters / nx).
-    nx = int(np.ceil(np.sqrt(n_clusters)))
-    ny = int(np.ceil(n_clusters / nx))
-    total_bins = nx * ny  # This is the actual number of bins/clusters.
-    
-    # Compute the bounding box of the data.
-    x_min, x_max = np.min(xy[:, 0]), np.max(xy[:, 0])
-    y_min, y_max = np.min(xy[:, 1]), np.max(xy[:, 1])
-    
-    # Create uniform bin edges in x and y.
-    x_edges = np.linspace(x_min, x_max, nx + 1)
-    y_edges = np.linspace(y_min, y_max, ny + 1)
-    
-    # For each point, find the corresponding bin index.
-    # np.digitize returns indices in 1...len(bins), so subtract 1 for 0-based indexing.
-    x_bin_indices = np.digitize(xy[:, 0], x_edges) - 1
-    y_bin_indices = np.digitize(xy[:, 1], y_edges) - 1
-    
-    # Points that lie exactly on the right edge might get index == nx or ny; clip these.
-    x_bin_indices = np.clip(x_bin_indices, 0, nx - 1)
-    y_bin_indices = np.clip(y_bin_indices, 0, ny - 1)
-    
-    # Compute a single cluster label for each point.
-    # Here we use label = i * ny + j so that labels run from 0 to (nx*ny - 1).
-    labels = x_bin_indices * ny + y_bin_indices
-
-    # Compute cluster centers and the sum-of-squared distances metric.
-    cluster_centers = np.zeros((total_bins, 2))
-    total_ssd = 0  # Sum of squared distances.
-    
-    for label in range(total_bins):
-        mask = (labels == label)
-        if np.any(mask):
-            cluster_points = xy[mask]
-            center = cluster_points.mean(axis=0)
-            cluster_centers[label] = center
-            # Compute sum of squared distances for points in this cluster.
-            ssd = np.sum((cluster_points - center)**2)
-            total_ssd += ssd
-        else:
-            # If no points fell into this bin, we assign the bin center.
-            # Determine bin indices in the grid corresponding to this label.
-            i = label // ny  # x bin index
-            j = label % ny   # y bin index
-            center_x = (x_edges[i] + x_edges[i+1]) / 2
-            center_y = (y_edges[j] + y_edges[j+1]) / 2
-            cluster_centers[label] = np.array([center_x, center_y])
-    
-    return labels, cluster_centers, total_ssd'''

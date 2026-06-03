@@ -2,29 +2,107 @@
 
 ## Overview
 
-The StainStyleSampler is a Python tool designed for extracting color and stain features from histological images. It leverages various color conversion techniques, stain deconvolution, and clustering methods to build feature representations, generate 2D embeddings (via PCA or UMAP), create histograms, and select representative image references. The project integrates multiple libraries including HistomicsTK for specialized color deconvolution and tissue detection.
+The StainStyleSampler is a Python tool designed for extracting color and stain features from histological images. It leverages color conversion, stain deconvolution, clustering, dimensionality reduction, and density estimation to build feature representations, generate 2D embeddings, create histograms, and select image references.
+
+The current workflow supports regular color-space features as well as stain-deconvolution features based on a Macenko stain-normalization model. The repository includes an `ExampleNotebook.ipynb` notebook that demonstrates the main workflow and produces the interactive figures used to inspect embeddings, histogram bins, clusters, and reference selections.
 
 ## Features
-- Features extraction:
-  - Extracts image features using different color spaces (lab, rgb, hsi).
-  - Supports stain deconvolution and splitting of stain features.
-  - Support for automatic clustering algorithms.
-- Features visualization:
-  - Generates 2D embeddings using PCA or UMAP.
-- Reference Selection:
-  - Supports various reference selection methods including random, representative, grouped, and density-based approaches.
 
-## Dependencies
+### Feature Extraction
 
+- Extracts image-level color features from recursive PNG datasets.
+- Supports `lab`, `rgb`, `hsv`, and `hsi` color modes.
+- Supports background removal before feature computation.
+- Supports stain-deconvolution features:
+  - flattened 2x3 stain matrix values
+  - two `maxC_target` values
+- Returns a dataframe containing image paths, RGB plotting colors, and extracted feature vectors.
+
+### Embeddings and Histograms
+
+- Builds 2D embeddings with PCA, UMAP, or t-SNE.
+- Can optionally use PCA prefiltering before UMAP or t-SNE.
+- Builds 2D histograms from the active embedding.
+- Exposes non-empty histogram-bin coordinates and full histogram-bin centers.
+
+### Reference Selection
+
+- Random reference images.
+- Representative reference images from clustering.
+- Density-based reference images from embedding-density contours.
+- Clustering utilities for K-means, Gaussian mixture models, and uniform binning.
+
+## Repository Layout
+
+```text
+StainStyleSampler.py          Main class and public workflow API
+Utils/                        Feature, clustering, reference, and visualization helpers
+ExampleNotebook.ipynb         End-to-end usage notebook with generated figures
+requirements.txt             Conda environment export from StainStyleSampler2
+```
 
 ## Installation
-1. Clone the Repository:
+
+Clone the repository and create an environment from the exported conda package list:
+
+```bash
+git clone https://github.com/patologiivest/StainStyleSampler.git
+cd StainStyleSampler
+conda create -n StainStyleSampler2 --file requirements.txt
+conda activate StainStyleSampler2
 ```
-   git clone https://github.com/patologiivest/StainStyleSampler.git
-   cd StainStyleSampler
+
+If the environment already exists, install or update packages from the same file:
+
+```bash
+conda install --name StainStyleSampler2 --file requirements.txt
 ```
-4. Create a Virtual Environment:
+
+## Quick Start
+
+```python
+from StainStyleSampler import StainStyleSampler
+
+sampler = StainStyleSampler()
+features, colors, dataframe, analysed_images = sampler.build_features(
+    dataset_path="/path/to/dataset",
+    stain_deconv=True,
+)
+
+sampler.build_embedding_map(mode="PCA", plot=True)
+embedding = sampler.get_embedding()
+
+sampler.build_2d_histogram(plot=False)
+sampler.build_bins_coordinates(plot=True)
+
+histogram = sampler.get_histogram()
+non_empty_bins = sampler.get_bins_coordinates()
+histogram_bin_centers = sampler.get_histogram_bin_centers()
 ```
-  conda env create -f "env-file.yml"
-  source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+## Reference Images
+
+Reference selection operates on the active embedding and histogram state. A typical sequence is:
+
+```python
+sampler.build_embedding_map(mode="PCA", plot=False)
+sampler.build_2d_histogram(plot=False)
+sampler.build_bins_coordinates(plot=False)
+
+sampler.get_image_references(reference_mode="random", nImages=20, plot=True)
+sampler.get_image_references(reference_mode="representative", plot=True)
+sampler.get_image_references(reference_mode="density", plot=True)
 ```
+
+The representative mode asks interactively for the clustering method and number of clusters. For non-interactive workflows, use the lower-level utilities in `Utils/ClusteringUtils.py` and `Utils/ReferenceUtils.py`.
+
+## Notebook and Figures
+
+`ExampleNotebook.ipynb` demonstrates the workflow step by step. It builds features, creates embeddings, plots histogram-bin coordinates, and shows random, representative, and density-based reference images. The repository does not currently track static figure files; figures are generated by the notebook cells and plotting arguments such as `plot=True`.
+
+## Notes
+
+- Dataset discovery is recursive and expects `.png` images.
+- Stain-deconvolution extraction uses `tiatoolbox.tools.stainnorm.MacenkoNormalizer`.
+- Density reference selection includes a fallback for cases where contour-selected points map to fewer unique images than requested.
+- The generated `requirements.txt` is a conda export from the local `StainStyleSampler2` environment, not a minimal hand-curated dependency list.

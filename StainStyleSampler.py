@@ -17,6 +17,7 @@ from sklearn.decomposition import PCA
 from sklearn.metrics import pairwise_distances
 from sklearn import mixture
 from umap.umap_ import UMAP
+from sklearn.manifold import TSNE
 import cv2
 import matplotlib.pyplot as plt
 from matplotlib.pyplot import hist2d
@@ -27,6 +28,7 @@ import tqdm
 from natsort import os_sorted
 from shapely.geometry import Polygon, MultiPolygon
 from matplotlib.path import Path
+import pathlib
 
 # HistomicsTK Imports
 from histomicstk.preprocessing.color_conversion import (
@@ -53,7 +55,7 @@ class StainStyleSampler():
 
     def build_features(self, dataset_path: str
                        , fraction: float = None, mode: str = 'lab', background_removal:bool = True,
-                       stain_deconv: bool = None,split_stains: bool = None,multiprocessing: bool = True) -> None:
+                       stain_deconv: bool = None, multiprocessing: bool = True) -> None:
         """
         Build features and color representations from images in the dataset.
 
@@ -62,22 +64,20 @@ class StainStyleSampler():
             fraction (float, optional): Fraction of images to sample (0 < fraction <= 1). Defaults to None (use all images).
             mode (str): Color mode for feature extraction ('lab', 'rgb', 'hsv', 'hsi'). Defaults to 'lab'.
             stain_deconv (bool, optional): Whether to use stain deconvolution. Defaults to None.
-            split_stains (bool, optional): Whether to split stain features. Defaults to None.
         """
 
-        def calculate_features_len(mode: str, stain_deconv: bool, stain_split: bool) -> int:
+        def calculate_features_len(mode: str, stain_deconv: bool) -> int:
             """
-            Calculate the length of features based on mode, stain_deconv, and stain_split.
+            Calculate the length of features based on mode, stain_deconv
 
             Args:
                 mode (str): The color mode ('lab', 'rgb', 'hsv', 'hsi').
                 stain_deconv (bool): Whether to use stain deconvolution.
-                stain_split (bool): Whether to split stain features.
 
             Returns:
                 int: The length of features.
             """
-            # Validate mode
+            # Validate mode__perform_clustering__
             valid_modes = ['lab', 'rgb', 'hsv', 'hsi']
             if mode not in valid_modes:
                 raise ValueError(f"Invalid mode '{mode}'. Supported modes are: {valid_modes}")
@@ -88,12 +88,10 @@ class StainStyleSampler():
                     return 12  # Mode-based features
                 else:
                     return 6
-            elif not stain_split:
-                return 8  # Stain deconvolution without split
             else:
-                return 24  # Stain deconvolution with split
+                return 8  # Stain deconvolution (2x3 stain matrix + 1x2 maxC)
             
-        def process_individual_image(image_path: str,mode: str,background_removal:bool,stain_deconv: bool, split_stains: bool) -> tuple:
+        def process_individual_image(image_path: str,mode: str,background_removal:bool,stain_deconv: bool) -> tuple:
             """
             Process individual image to extract features and colors.
 
@@ -101,25 +99,23 @@ class StainStyleSampler():
                 image_path (str): Path to the image.
                 mode (str): Color mode for feature extraction ('lab', 'rgb', 'hsv', 'hsi').
                 stain_deconv (bool): Whether to use stain deconvolution.
-                split_stains (bool): Whether to split stain features.
 
             Returns:
                 tuple: Tuple containing features and colors.
             """
             img = Image.open(image_path).resize((512, 512))
             img_array = np.array(img)[:,:,:3]
-
-            # Compute color features
-            features = SU.get_stain_features(img_array, mode, background_removal,stain_deconv, split_stains)
-
-            # Compute mean RGB vector for scatterplot
-            colors = np.mean(img_array.reshape((512*512,3)), axis=0)/255.0
-
+            if not stain_deconv:
+                # Compute color features
+                features,colors = SU.get_stain_features(img_array, mode, background_removal,stain_deconv)
+                colors = colors/255.0
+            else:
+                features = SU.get_stains_deconvoluted(img_array,I_0=255)
+                colors = np.mean(img_array[SU.get_background_mask(img_array) == 0],axis=0)/255.0
             return features, colors,image_path
 
         assert background_removal in (None, True, False), "Background removal argument must be either None, True, or False"
         assert stain_deconv in (None,True,False), "Stain deconv argument must be either None,True or False"
-        assert split_stains in (None,True,False), "Split stains argument must be either None,True or False"
         assert multiprocessing in (None,True,False), "Multiprocessing argument must be either None,True or False"
 
         if dataset_path is None:
@@ -129,8 +125,7 @@ class StainStyleSampler():
         self.mode = mode
         # ----------------------------------
         # Build list of images in the given path
-        all_images = np.array(os_sorted(glob.glob(f"{dataset_path}\**\*.png",recursive=True)))
-
+        all_images = np.array(sorted(str(p) for p in pathlib.Path(dataset_path).rglob("*.png")))
         if len(all_images) == 0:
             raise FileNotFoundError(f"No images found in the specified path: {dataset_path}")
 
@@ -148,7 +143,7 @@ class StainStyleSampler():
         # ----------------------------------
         # Initialize arrays for features and colors
         num_images = len(self.images)
-        len_features = calculate_features_len(mode, stain_deconv, split_stains)
+        len_features = calculate_features_len(mode, stain_deconv)
         
         self.features = np.empty((num_images, len_features))
         self.colors = np.empty((num_images, 3))
@@ -158,7 +153,7 @@ class StainStyleSampler():
         # Compute features for each image
         if multiprocessing:
             results = ParallelPbar("Extracting features")(n_jobs=8)(
-                delayed(process_individual_image)(image_path, mode,background_removal, stain_deconv, split_stains)
+                delayed(process_individual_image)(image_path, mode,background_removal, stain_deconv)
                     for image_path in self.images
             )
 
@@ -169,7 +164,7 @@ class StainStyleSampler():
 
         else:
             for i, image_path in enumerate(tqdm.tqdm(self.images, desc="Computing Features")):
-                features, colors = process_individual_image(image_path, mode,background_removal, stain_deconv, split_stains)
+                features, colors,image_path = process_individual_image(image_path, mode,background_removal, stain_deconv)
                 
                 self.features[i] = features
                 self.colors[i] = colors
@@ -177,6 +172,7 @@ class StainStyleSampler():
         
         # Normalize features to [0, 1]
         self.features = (self.features - np.min(self.features, axis=0)) / (np.max(self.features, axis=0) - np.min(self.features, axis=0))
+
         
         # ------------------------------------------------------
         # Build the DataFrame
@@ -192,42 +188,54 @@ class StainStyleSampler():
         
         return self.features,self.colors,self.df,analysed_images
     
-    def build_embedding_map(self, mode: str = 'UMAP', plot: bool = False, save: bool = False, pca_components: int = None) -> None:
+    def build_embedding_map(self,mode: str = 'UMAP',plot: bool = False,save: bool = False,
+                            prefiltering: bool = False,pca_components: int = None) -> np.ndarray:
         """
-        Build a 2D embedding map using PCA or UMAP.
+        Build a 2D embedding map using PCA, UMAP, or t-SNE.
 
         Args:
-            mode (str): Embedding mode ('UMAP' or 'PCA'). Default is 'UMAP'.
-            plot (bool): Whether to plot the embedding. Default is False.
-            save (bool): Whether to save the embedding plot. Default is False.
-            pca_components (int): Number of components for PCA. Default is None (use all components).
+            mode (str): Embedding mode ('UMAP', 'PCA', 'TSNE'). Default: 'UMAP'.
+            plot (bool): Plot the embedding. Default: False.
+            save (bool): Save the embedding plot. Default: False.
+            prefiltering (bool): If True, run PCA before UMAP or t-SNE. Default: False.
+            pca_components (int): Number of components for PCA. Default: None.
 
         Returns:
-            None
+            np.ndarray: The resulting 2D embedding.
         """
-        assert mode in ['UMAP', 'PCA'], "Invalid mode, choose between 'UMAP' and 'PCA'."
-        # Reset PCA and UMAP embeddings
-        self.PCA = None
-        self.UMAP = None
+        assert mode in ['UMAP', 'PCA', 'TSNE'], "Invalid mode, choose 'UMAP', 'PCA', or 'TSNE'."
+        self.PCA, self.UMAP, self.TSNE = None, None, None
 
-        # Perform PCA prefiltration
-        pca = PCA(n_components=pca_components) if pca_components else PCA()
-        self.PCA = pca.fit_transform(self.features)
+        # PCA prefiltering
+        data = self.features
+        if prefiltering:
+            n_components = pca_components if pca_components is not None else min(50, data.shape[1])
+            pca = PCA(n_components=n_components)
+            data = pca.fit_transform(data)
 
         if mode == 'PCA':
-            embedding, title, save_path = self.PCA, f"PCA embedding ({self.mode})", "PCA.pdf"
+            # Main PCA embedding to 2D
+            pca = PCA(n_components=2)
+            embedding = pca.fit_transform(data)
+            self.PCA = embedding
+            title = f"PCA embedding ({getattr(self, 'mode', '')})"
+            save_path = "PCA.pdf"
+        elif mode == 'UMAP':
+            reducer = UMAP(n_components=2, random_state=13)
+            embedding = reducer.fit_transform(data)
+            self.UMAP = embedding
+            title = f"UMAP embedding ({getattr(self, 'mode', '')})"
+            save_path = "UMAP.pdf"
+        elif mode == 'TSNE':
+            reducer = TSNE(n_components=2, random_state=13)
+            embedding = reducer.fit_transform(data)
+            self.TSNE = embedding
+            title = f"t-SNE embedding ({getattr(self, 'mode', '')})"
+            save_path = "TSNE.pdf"
         else:
-            # Perform UMAP on PCA-filtered data
-            umap = UMAP(random_state=13)
-            embedding = umap.fit_transform(self.PCA)
-            self.UMAP = np.array(list(zip(embedding[:,0],embedding[:,1])))
-            
-            embedding = self.UMAP
-            title, save_path = f"UMAP embedding ({self.mode})", "UMAP.pdf"
-            # Clear PCA embedding to save memory
-            self.PCA = None
+            raise ValueError(f"Unknown embedding mode: {mode}")
 
-        # Save or plot embedding
+        # Plot or save embedding if requested
         VU.save_or_plot(
             lambda: (
                 plt.scatter(embedding[:, 0], embedding[:, 1], c=self.colors),
@@ -243,7 +251,7 @@ class StainStyleSampler():
     
     def build_2d_histogram(self, bins: int = 100, plot: bool = False, save: bool = False) -> None:
         """
-        Build a 2D histogram using PCA or UMAP embeddings.
+        Build a 2D histogram using PCA, UMAP, or t-SNE embeddings.
 
         Args:
             bins (int): Number of bins for the histogram. Default is 100.
@@ -251,18 +259,21 @@ class StainStyleSampler():
             save (bool): Whether to save the histogram plot. Default is False.
 
         Returns:
-            None
+            True
         """
-        # Determine which embedding method was used
+        # Determine which embedding method was used (priority: UMAP, t-SNE, PCA)
         embedding = None
         embedding_name = None
 
-        if self.UMAP is not None and self.PCA is None:
+        if isinstance(self.UMAP, np.ndarray) and self.UMAP.size > 0:
             embedding, embedding_name = self.UMAP, "UMAP"
-        elif self.PCA is not None and self.UMAP is None:
+        elif isinstance(self.TSNE, np.ndarray) and self.TSNE.size > 0:
+            embedding, embedding_name = self.TSNE, "t-SNE"
+        elif isinstance(self.PCA, np.ndarray) and self.PCA.size > 0:
             embedding, embedding_name = self.PCA, "PCA"
         else:
-            raise ValueError("No valid embedding found. Ensure either PCA or UMAP has been computed.")
+            raise ValueError("No valid embedding found. Ensure UMAP, t-SNE, or PCA has been computed.")
+
 
         # Compute histogram range dynamically
         range_ = [
@@ -283,6 +294,7 @@ class StainStyleSampler():
             save_path="2Dhistogram.pdf" if save else None,
             plotting_graphs=plot
         )
+        return True
 
     def build_bins_coordinates(self, plot: bool = False, save: bool = False) -> None:
         """
@@ -293,7 +305,7 @@ class StainStyleSampler():
             save (bool): Whether to save the plot. Default is False.
 
         Returns:
-            None
+            True
         """
         if self.HISTOGRAM is None:
             raise ValueError("HISTOGRAM has not been computed. Run `build_2d_histogram` first.")
@@ -303,6 +315,8 @@ class StainStyleSampler():
         # Compute center coordinates of bins
         x_centers = (x_edges[:-1] + x_edges[1:]) / 2
         y_centers = (y_edges[:-1] + y_edges[1:]) / 2
+        
+        self.bin_centers = np.column_stack((x_centers,y_centers))
 
         # Get indices of non-empty bins
         non_empty_indices = np.column_stack(np.where(histogram > 0))
@@ -324,16 +338,18 @@ class StainStyleSampler():
             save_path="BinsCoordinates.pdf" if save else None,
             plotting_graphs=plot
         )
+        return True
 
     def get_image_references(self, reference_mode: str = 'representative',
-                              density_selection_mode: str = 'original', density_percentile_level: int = 2,
-                         plot: bool = False, save: bool = False) -> None:
+                              density_selection_mode: str = 'sorted_regions', 
+                              density_percentile_level: int = 2,
+                              nImages:int = None,plot: bool = False, save: bool = False) -> None:
         """
-        Selects reference images based on different modes: 'random', 'density', 'representative', or 'grouped'.
+        Selects reference images based on different modes: 'random', 'density', 'representative'
         Automatically determines whether to use UMAP or PCA for clustering.
 
         Args:
-            reference_mode (str): Reference selection mode ('random', 'density', 'representative', 'grouped').
+            reference_mode (str): Reference selection mode ('random', 'density', 'representative').
             density_percentile_level (int): Percentile level for density-based selection. Default is 2.
             plot (bool): Whether to plot results. Default is False.
             save (bool): Whether to save plots. Default is False.
@@ -348,47 +364,53 @@ class StainStyleSampler():
         self.N_Clusters = None
 
         # Validate reference_mode
-        valid_modes = ['random', 'density', 'representative', 'grouped']
+        valid_modes = ['random', 'density', 'representative']
         if reference_mode not in valid_modes:
             raise ValueError(f"Invalid reference mode '{reference_mode}'. Choose from {valid_modes}")
 
-        # Determine embedding method automatically (UMAP or PCA)
-        if self.UMAP is not None and self.PCA is None:
+        if isinstance(self.UMAP, np.ndarray) and self.UMAP.size > 0:
             embedding, embedding_name = self.UMAP, "UMAP"
-        elif self.PCA is not None and self.UMAP is None:
+        elif isinstance(self.TSNE, np.ndarray) and self.TSNE.size > 0:
+            embedding, embedding_name = self.TSNE, "t-SNE"
+        elif isinstance(self.PCA, np.ndarray) and self.PCA.size > 0:
             embedding, embedding_name = self.PCA, "PCA"
         else:
-            raise ValueError("No valid embedding found. Ensure either PCA or UMAP has been computed.")
+            raise ValueError("No valid embedding found. Ensure UMAP, t-SNE, or PCA has been computed.")
 
         # Handle different reference modes
         if reference_mode == 'random':
-            self.__handle_random_reference__(embedding, embedding_name, plot, save)
+            self.__handle_random_reference__(embedding, embedding_name, plot, save,nImages=nImages)
         elif reference_mode == 'representative':
             self.__handle_representative_reference__(embedding,self.XY, embedding_name, plot, save)
-        elif reference_mode == 'grouped':
-            assert embedding_name == 'UMAP', "Grouped reference selection was only implemented for UMAP embedding."
-            self.__handle_grouped_reference__(embedding, self.XY, embedding_name, plot, save)
         elif reference_mode == 'density':
             self.__handle_density_reference__(embedding,embedding_name,density_selection_mode,density_percentile_level,plot,save)
         
 
 
-    def __handle_random_reference__(self, embedding: np.ndarray, embedding_name: str, plot: bool, save: bool) -> None:
+    def __handle_random_reference__(self, embedding: np.ndarray, embedding_name: str, plot: bool, save: bool,nImages: int = None) -> None:
         """Handles reference selection using a random sampling method."""
-        self.nImages = RU.input_for_number_of_images()
+        if nImages is None:
+            self.nImages = RU.input_for_number_of_images()
+        else:
+            self.nImages = nImages
+        
         self.ReferenceFiles = RU.get_references(
             embedding, self.colors, self.XY, None, None, self.images, 
             n_images=self.nImages, reference_mode='random', plot=plot, save=save
         )
 
-    def __handle_representative_reference__(self, embedding: np.ndarray,XY: np.ndarray, embedding_name: str, plot: bool, save: bool) -> None:
+    def __handle_representative_reference__(self, embedding: np.ndarray,XY: np.ndarray, embedding_name: str, plot: bool, save: bool,
+                                            method_for_clustering = None, method_for_number_of_clusters = None, nImages = None) -> None:
         """Handles reference selection using a representative sampling method."""
+        if method_for_clustering is None:
+            method_for_clustering = CU.input_for_clustering_method()
+        
+        if method_for_number_of_clusters is None:
+            method_for_number_of_clusters = CU.input_for_number_of_clusters_method(method_for_clustering)
+            # Define number of clusters
+            self.__define_number_of_clusters__(method=method_for_number_of_clusters, clustering_method=method_for_clustering, plot=plot, save=save)
+        
 
-        method_for_clustering = CU.input_for_clustering_method()
-        method_for_number_of_clusters = CU.input_for_number_of_clusters_method(method_for_clustering)
-
-        # Define number of clusters
-        self.__define_number_of_clusters__(method=method_for_number_of_clusters, clustering_method=method_for_clustering, plot=plot, save=save)
 
         # Perform clustering
         self.__perform_clustering__(clustering_method=method_for_clustering, plot=plot, save=save)
@@ -410,39 +432,13 @@ class StainStyleSampler():
             self.images, reference_mode='representative', plot=plot, save=save
         )
 
-    def __handle_grouped_reference__(self,embedding: np.ndarray, XY: np.ndarray, embedding_name: str, plot: bool, save: bool) -> None:
-        """Handles reference selection using a grouped sampling method."""
-        method_for_clustering = CU.input_for_clustering_method()
-        method_for_number_of_clusters = CU.input_for_number_of_clusters_method(method_for_clustering)
-        
-        # Define number of clusters
-        self.__define_number_of_clusters__(method=method_for_number_of_clusters, clustering_method=method_for_clustering, plot=plot, save=save)
-
-        # Perform clustering
-        self.__perform_clustering__(clustering_method=method_for_clustering, plot=plot, save=save)
-
-        # Scatter plot of clusters
-        VU.save_or_plot(
-            lambda: (
-                plt.scatter(self.XY[:, 0], self.XY[:, 1], c=self.cluster_labels),
-                plt.axis('off'),
-                plt.title(f"Clusters ({embedding_name})")
-            ),
-            save_path="Clusters.pdf" if save else None,
-            plotting_graphs=plot
-        )
-
-        # Select reference images based on clustering method
-        self.ReferenceFiles,self.ClusterStats = RU.get_references(embedding,self.colors,XY,self.cluster_labels,self.cluster_centers,
-                                                                  self.images,h=self.HISTOGRAM,reference_mode='grouped',plot=plot,save=save,embedding_name=embedding_name)
-
     def __handle_density_reference__(self,embedding: np.ndarray,embedding_name: str,density_selection_mode: str, density_percentile_level: int,plot: bool,save: bool) -> None:
         # Input the number of images to retrieve
         self.nImages = RU.input_for_number_of_images()
 
         self.ReferenceFiles,self.contours = RU.get_references(
             embedding, self.colors, None, None,
-              None, self.images,n_images=self.nImages,
+              None, self.images,h=self.HISTOGRAM,n_images=self.nImages,
                 reference_mode='density', plot=plot,
                   save=save,embedding_name=embedding_name,
                   density_selection_mode=density_selection_mode, density_percentile_level=density_percentile_level
@@ -472,20 +468,44 @@ class StainStyleSampler():
     def get_colors(self):
         return self.colors
     
+    def get_pca(self):
+        """Return the PCA embedding, or raise if not generated."""
+        if self.PCA is not None:
+            return self.PCA
+        raise ValueError("PCA embedding has not been generated.")
+
     def get_umap(self):
-        return self.UMAP
-    
-    def get_pca(self):  
-        return self.PCA
+        """Return the UMAP embedding, or raise if not generated."""
+        if self.UMAP is not None:
+            return self.UMAP
+        raise ValueError("UMAP embedding has not been generated.")
+
+    def get_tsne(self):
+        """Return the t-SNE embedding, or raise if not generated."""
+        if self.TSNE is not None:
+            return self.TSNE
+        raise ValueError("t-SNE embedding has not been generated.")
     
     def get_embedding_method(self):
-        if isinstance(self.UMAP, np.ndarray) and self.UMAP.size > 0 and not isinstance(self.PCA, np.ndarray):
+        if isinstance(self.UMAP, np.ndarray) and self.UMAP.size > 0:
             return 'UMAP'
-        elif isinstance(self.PCA, np.ndarray) and self.PCA.size > 0 and not isinstance(self.UMAP, np.ndarray):
+        elif isinstance(self.TSNE, np.ndarray) and self.TSNE.size > 0:
+            return 'TSNE'
+        elif isinstance(self.PCA, np.ndarray) and self.PCA.size > 0:
             return 'PCA'
         else:
-            raise ValueError("Both UMAP and PCA embeddings are either unset or invalid. Ensure one is properly computed.")
+            raise ValueError("No embedding (UMAP, t-SNE, or PCA) has been generated or all are empty.")
     
+    def get_embedding(self):
+        """Return the most recently generated embedding (PCA, UMAP, or t-SNE)."""
+        if self.UMAP is not None:
+            return self.UMAP
+        if self.TSNE is not None:
+            return self.TSNE
+        if self.PCA is not None:
+            return self.PCA
+        raise ValueError("No embedding has been generated yet.")
+
     def get_histogram(self):
         return self.HISTOGRAM
     
@@ -576,3 +596,6 @@ class StainStyleSampler():
     
     def get_N_Clusters(self):
         return self.N_Clusters
+    
+    def get_histogram_bin_centers(self):
+        return self.bin_centers
